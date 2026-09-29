@@ -188,10 +188,23 @@
       if (!r.nextCursor || !last || (!moreLoot && (!myId || mine))) break;
       cursor = r.nextCursor;
     }
-    return { items: all, mine };
+    return { items: markOutliers(all), mine };
+  }
+
+  // Equipment loot runs from high to low tier down the ranking. An item with a higher tier than every
+  // equipment item in the 30 ranks above it doesn't fit that order (seen: a pants5 at rank 1030 among
+  // tier 2 items, created hours before its neighbours). Such items are flagged and hidden.
+  function markOutliers(items) {
+    const eq = items.filter(it => it.lootItem && tierOf(it.lootItem.code) !== null);
+    eq.forEach((it, i) => {
+      const above = eq.slice(Math.max(0, i - 30), i).map(a => tierOf(a.lootItem.code));
+      it.suspect = above.length >= 10 && tierOf(it.lootItem.code) > Math.max(...above);
+    });
+    return items;
   }
 
   const mk = (b, scope, side, it, endsAt, n, mine) => ({
+    suspect: !!it.suspect,
     myDmg: mine ? mine.value : 0, myRank: mine ? mine.rank : null,
     battleId: b._id, btype: b.type || '', scope, side, rank: it.rank, dmg: it.value, endsAt,
     region: n.region, sideCountry: n[side], vs: `${n.attacker} vs ${n.defender}`,
@@ -316,7 +329,9 @@
     const weapons = wantedWeapons;
     const showBattle = $('showBattle').checked, showRound = $('showRound').checked;
     const tourFilter = $('myTour').checked && playerState && !playerState.error;
+    const suspects = rows.filter(r => r.suspect).length;
     const list = rows.filter(r =>
+      !r.suspect &&
       !hiddenTypes.has(r.btype || 'unknown') &&
       (!tourFilter || r.btype !== 'tournament' || r.canJoin) &&
       (r.tier === null ? weapons.has(r.code) : r.tier >= minTier) &&
@@ -347,7 +362,7 @@
     document.querySelectorAll('th').forEach(th => th.onclick = () => {
       const k = th.dataset.k; sortDir = sortKey === k ? -sortDir : 1; sortKey = k; render();
     });
-    $('status').textContent = baseStatus + ` Showing ${list.length}.`;
+    $('status').textContent = baseStatus + ` Showing ${list.length}.` + (suspects ? ` ${suspects} out-of-order item(s) hidden.` : '');
     saveSettings();
   }
 
