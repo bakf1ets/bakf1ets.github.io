@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WarEra loot scanner</title>
+<!-- Standalone page: open this file in your browser next to the game.
+     Uses only public, read-only WarEra API calls (battle.getBattles, battleRanking.getRanking,
+     gameConfig.getGameConfig, region.getRegionsObject, country.getAllCountries,
+     tournament.getById, tournamentTeam.getById, mu.getById, search.searchAnything, user.getUserLite)
+     without any login session or API key. Nothing runs inside app.warera.io. -->
+<style>
+  :root{--bg:#10161f;--panel:#161e2a;--line:#253245;--text:#dfe6ef;--muted:#93a4b8;--link:#7fb2ff;--battle:#f0c36a;--round:#8fd6a4;--ctl:#1f2a3a;--ctl-line:#3a4b62}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+  header{position:sticky;top:0;z-index:2;background:var(--panel);border-bottom:1px solid var(--line);padding:14px 18px;display:flex;flex-wrap:wrap;gap:14px;align-items:center}
+  h1{margin:0 auto 0 0;font-size:17px;font-weight:650}
+  label{display:inline-flex;gap:5px;align-items:center;cursor:pointer}
+  input[type=text]{background:var(--ctl);color:var(--text);border:1px solid var(--ctl-line);border-radius:6px;padding:5px 8px;font:inherit}
+  select,button{background:var(--ctl);color:var(--text);border:1px solid var(--ctl-line);border-radius:6px;padding:5px 10px;font:inherit;cursor:pointer}
+  button:hover{background:#2a3850}
+  button:disabled{opacity:.6;cursor:wait}
+  :focus-visible{outline:2px solid var(--link);outline-offset:2px}
+  #weapons,#types{display:inline-flex;flex-wrap:wrap;gap:10px}
+  #types{padding-left:14px;border-left:1px solid var(--line)}
+  #status{padding:8px 18px;color:var(--muted);border-bottom:1px solid var(--line)}
+  main{padding:0 0 24px}
+  .wrap{overflow-x:auto}
+  table{width:100%;border-collapse:collapse}
+  th,td{padding:7px 12px;text-align:left;border-bottom:1px solid #1e2939;white-space:nowrap}
+  th{position:sticky;top:0;background:#1a2331;font-weight:600;cursor:pointer;user-select:none}
+  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+  tbody tr:hover{background:#18212e}
+  a{color:var(--link)}
+  .battle{color:var(--battle)} .round{color:var(--round)}
+  .muted{color:var(--muted)}
+  .empty{padding:18px}
+</style>
+</head>
+<body>
+<header>
+  <h1>WarEra loot scanner</h1>
+  <label>Min. equipment tier
+    <select id="tier"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option selected>6</option></select>
+  </label>
+  <span id="weapons"></span>
+  <span id="types" aria-label="Battle type"></span>
+  <label>Player <input id="player" type="text" placeholder="your username" size="14" autocomplete="off"></label>
+  <label title="Only show tournament loot on the side of a team that includes your MU or your country"><input type="checkbox" id="myTour" checked> Only tournaments I can join</label>
+  <label><input type="checkbox" id="showBattle" checked> Battle</label>
+  <label><input type="checkbox" id="showRound" checked> Round</label>
+  <button id="rescan">Rescan</button>
+</header>
+<div id="status">Scanning…</div>
+<main><div class="wrap" id="body"></div></main>
+
+<script>
+(() => {
+  const API = 'https://api2.warera.io/trpc/';
+  const GAME = 'https://app.warera.io/battle/';
+  // The API allows 100 requests per minute without login. Stay under that and wait out a 429.
+  const LIMIT = 90, WINDOW = 60000;
+  const sent = [];
+  let onWait = () => {};
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  async function slot() {
+    for (;;) {
+      const now = Date.now();
+      while (sent.length && now - sent[0] > WINDOW) sent.shift();
+      if (sent.length < LIMIT) { sent.push(now); return; }
+      onWait(Math.ceil((WINDOW - (now - sent[0])) / 1000));
+      await sleep(WINDOW - (now - sent[0]) + 50);
+    }
+  }
+  // Calls are grouped into tRPC batch requests (several procedures per HTTP request).
+  // The limit counts HTTP requests, not procedures (tested: 150 calls in 4 requests, no 429).
+  const MAX_PER_BATCH = 40, MAX_URL = 8000;
+  const queue = [];
+  let flushTimer = null;
+  function q(proc, input) {
+    return new Promise((resolve, reject) => {
+      queue.push({ proc, input, resolve, reject, enc: encodeURIComponent(JSON.stringify(input)).length + proc.length + 12 });
+      if (!flushTimer) flushTimer = setTimeout(flush, 20);
+    });
+  }
+  function flush() {
+    flushTimer = null;
+    while (queue.length) {
+      const batch = []; let len = API.length + 40;
+      while (queue.length && batch.length < MAX_PER_BATCH && (batch.length === 0 || len + queue[0].enc < MAX_URL)) {
+        len += queue[0].enc; batch.push(queue.shift());
+      }
+      send(batch);
+    }
+  }
+  async function send(batch, tries = 3) {
+    try {
+      await slot();
+      const input = Object.fromEntries(batch.map((c, i) => [i, c.input]));
+      const url = API + batch.map(c => c.proc).join(',') + '?batch=1&input=' + encodeURIComponent(JSON.stringify(input));
+      const r = await fetch(url, { credentials: 'omit' });
+      if (r.status === 429 && tries > 1) { onWait(60); await sleep(60000); return send(batch, tries - 1); }
+      const j = await r.json();
+      if (!Array.isArray(j)) throw new Error(j.message || 'HTTP ' + r.status);
+      j.forEach((x, i) => {
+        const c = batch[i];
+        if (x && x.result) c.resolve(x.result.data);
+        else c.reject(new Error(c.proc + ': ' + ((x && x.error && x.error.message) || 'no result')));
+      });
+    } catch (e) { batch.forEach(c => c.reject(e)); }
+  }
+  // Data that doesn't change during a session is fetched once.
+  const cache = new Map();
+  const once = (key, fn) => { if (!cache.has(key)) cache.set(key, fn().catch(e => { cache.delete(key); throw e; })); return cache.get(key); };
+
+  const $ = id => document.getElementById(id);
+  const fmt = n => n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : String(Math.round(n));
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const tierOf = code => { const m = /^([a-z]+?)(\d+)$/.exec(code); return m ? m && +m[2] : null; };
+
+  // Filter and sort choices are remembered in this browser (localStorage). Storage can be unavailable; then defaults apply.
+  const SETTINGS_KEY = 'warera-loot-scanner:settings:v1';
+  const saved = (() => { try { return JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {}; } catch { return {}; } })();
+  const wantedWeapons = new Set(Array.isArray(saved.weapons) ? saved.weapons : []);
+  // Battle types are stored as the ones you switched OFF, so a type that appears later is shown by default.
+  const hiddenTypes = new Set(Array.isArray(saved.hiddenTypes) ? saved.hiddenTypes : []);
+  let playerState = null;
+  let rows = [], sortKey = saved.sortKey || 'dmg', sortDir = saved.sortDir === -1 ? -1 : 1, baseStatus = '';
+  function saveSettings() {
+    try {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify({
+        tier: $('tier').value, weapons: [...wantedWeapons], hiddenTypes: [...hiddenTypes],
+        player: $('player').value.trim(), myTour: $('myTour').checked,
+        showBattle: $('showBattle').checked, showRound: $('showRound').checked, sortKey, sortDir
+      }));
+    } catch { /* storage unavailable: settings only last this session */ }
+  }
+  const TICK_MIN = 2; // measured: ~2 minutes per tick (not in the game config)
+
+  // Points the next tick is worth, from gameConfig.battle.tickPoints ({"1":1,"100":2,...}), keyed by ticks done.
+  const tickValue = (cfg, ticksDone) => {
+    let v = 1;
+    for (const [k, pts] of Object.entries(cfg.tickPoints || {})) if (ticksDone >= +k) v = pts;
+    return v;
+  };
+  // Ticks needed for one side to reach pointsToWinRound if it wins every tick from now on.
+  const ticksToWin = (cfg, ticksDone, points) => {
+    let n = 0, t = ticksDone, p = points;
+    while (p < (cfg.pointsToWinRound || 300) && n < 5000) { p += tickValue(cfg, t); t++; n++; }
+    return n;
+  };
+  // Earliest possible end of the current round and of the battle, as timestamps (ms).
+  // Assumes the side that finishes first wins every tick from now on; later is always possible.
+  function earliestEnds(cfg, b) {
+    const c = b.currentRound || {}, L = c.live || {};
+    const ticksDone = L.ticksCount || 0;
+    const next = L.nextTickAt ? new Date(L.nextTickAt).getTime() : Date.now() + TICK_MIN * 60000;
+    const need = b.roundsToWin || cfg.roundsToWin || 2;
+    const fullRound = ticksToWin(cfg, 0, 0) * TICK_MIN * 60000;
+    const sides = ['attacker', 'defender'].map(k => {
+      const pts = (c[k] && c[k].points) || 0;
+      const won = (b[k] && b[k].wonRoundsCount) || 0;
+      const roundEnd = next + (ticksToWin(cfg, ticksDone, pts) - 1) * TICK_MIN * 60000;
+      const battleEnd = roundEnd + Math.max(0, need - won - 1) * fullRound;
+      return { roundEnd, battleEnd };
+    });
+    return {
+      roundEnd: Math.min(sides[0].roundEnd, sides[1].roundEnd),
+      battleEnd: Math.min(sides[0].battleEnd, sides[1].battleEnd)
+    };
+  }
+  const dur = ms => {
+    const m = Math.max(0, Math.round(ms / 60000));
+    return m >= 60 ? `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m` : `${m}m`;
+  };
+
+  // All ranks that carry loot: 100 per page (API maximum). Keep paging while the last rank still has loot,
+  // or while your own entry hasn't been found yet (so we know your damage on that side).
+  async function lootRanks(input, myId) {
+    const all = [];
+    let cursor, mine = null;
+    for (let page = 0; page < 15; page++) {
+      const r = await q('battleRanking.getRanking', cursor ? { ...input, limit: 100, cursor } : { ...input, limit: 100 });
+      const items = r.items || [];
+      for (const it of items) { if (it.lootItem) all.push(it); if (myId && it.user === myId) mine = it; }
+      const last = items[items.length - 1];
+      const moreLoot = last && last.lootItem;
+      if (!r.nextCursor || !last || (!moreLoot && (!myId || mine))) break;
+      cursor = r.nextCursor;
+    }
+    return { items: all, mine };
+  }
+
+  const mk = (b, scope, side, it, endsAt, n, mine) => ({
+    myDmg: mine ? mine.value : 0, myRank: mine ? mine.rank : null,
+    battleId: b._id, btype: b.type || '', scope, side, rank: it.rank, dmg: it.value, endsAt,
+    region: n.region, sideCountry: n[side], vs: `${n.attacker} vs ${n.defender}`,
+    canJoin: n.join ? n.join[side] : true,
+    code: it.lootItem.code, tier: tierOf(it.lootItem.code), skills: it.lootItem.skills || {},
+    state: it.lootItem.state, maxState: it.lootItem.maxState
+  });
+
+  async function scan() {
+    $('rescan').disabled = true;
+    $('status').textContent = 'Scanning…';
+    let waitUntil = 0;
+    onWait = secs => { waitUntil = Date.now() + secs * 1000; $('status').textContent = `Waiting ${secs}s for the API limit (100 requests per minute), then continuing…`; };
+    try {
+      const [res, config, regions, countries] = await Promise.all([
+        q('battle.getBattles', { isActive: true, limit: 100 }),
+        once('config', () => q('gameConfig.getGameConfig', {})),
+        once('regions', () => q('region.getRegionsObject', {})),
+        once('countries', () => q('country.getAllCountries', {}))
+      ]);
+      const cfg = config.battle || {};
+      const countryName = Object.fromEntries((countries || []).map(c => [c._id, c.name]));
+      // Tournament battles have teams instead of countries: name them after their MU, else their countries.
+      const idOf = x => (x && typeof x === 'object' ? x._id : x);
+      const teamInfo = id => once('team:' + id, async () => {
+        const t = await q('tournamentTeam.getById', { tournamentTeamId: id });
+        const mus = (t.mus || []).map(idOf).filter(Boolean);
+        const countries = (t.countries || []).map(idOf).filter(Boolean);
+        let label = null;
+        if (mus.length === 1) {
+          const mu = await once('mu:' + mus[0], () => q('mu.getById', { muId: mus[0] })).catch(() => null);
+          if (mu && mu.name) label = mu.name;
+        }
+        if (!label) { const cs = countries.map(c => countryName[c]).filter(Boolean); label = cs.length ? cs.join(', ') : 'Team #' + (t.number ?? '?'); }
+        return { label, mus, countries };
+      }).catch(() => ({ label: 'Unknown team', mus: [], countries: [] }));
+
+      // Your player: found by username, gives your MU and country (public data).
+      const playerName = $('player').value.trim();
+      const me = playerName ? await once('player:' + playerName.toLowerCase(), async () => {
+        const r = await q('search.searchAnything', { searchText: playerName });
+        const users = await Promise.all((r.userIds || []).slice(0, 10).map(id => q('user.getUserLite', { userId: id }).catch(() => null)));
+        const u = users.find(x => x && x.username && x.username.toLowerCase() === playerName.toLowerCase());
+        if (!u) throw new Error(`Player "${playerName}" not found`);
+        const mu = u.mu ? await once('mu:' + idOf(u.mu), () => q('mu.getById', { muId: idOf(u.mu) })).catch(() => null) : null;
+        return { id: u._id, name: u.username, mu: idOf(u.mu) || null, muName: mu && mu.name, country: idOf(u.country) || null };
+      }).catch(e => ({ error: e.message })) : null;
+      const myId = me && !me.error ? me.id : null;
+      const canJoin = team => !!(me && !me.error && ((me.mu && team.mus.includes(me.mu)) || (me.country && team.countries.includes(me.country))));
+      const names = async b => {
+        if (b.type === 'tournament') {
+          const none = { label: 'Unknown team', mus: [], countries: [] };
+          const [tour, att, def] = await Promise.all([
+            b.tournament ? once('tour:' + b.tournament, () => q('tournament.getById', { tournamentId: b.tournament })).catch(() => null) : null,
+            b.attacker && b.attacker.tournamentTeam ? teamInfo(b.attacker.tournamentTeam) : none,
+            b.defender && b.defender.tournamentTeam ? teamInfo(b.defender.tournamentTeam) : none
+          ]);
+          return { region: (tour && tour.name) || 'Tournament', attacker: att.label, defender: def.label,
+            join: { attacker: canJoin(att), defender: canJoin(def) } };
+        }
+        return {
+          region: (regions[b.defender && b.defender.region] || {}).name || 'Unknown region',
+          attacker: countryName[b.attacker && b.attacker.country] || 'Unknown',
+          defender: countryName[b.defender && b.defender.country] || 'Unknown'
+        };
+      };
+      const battles = res.items || [];
+      let note = res.nextCursor ? ' Warning: more than 100 active battles, only the first 100 were scanned.' : '';
+      const found = [], tasks = [];
+      for (const b of battles) {
+        const roundId = b.currentRound && typeof b.currentRound === 'object' ? b.currentRound._id : b.currentRound;
+        const roundNo = (b.rounds || []).indexOf(roundId) + 1;
+        const ends = earliestEnds(cfg, b);
+        const nP = names(b);
+        for (const side of ['attacker', 'defender']) {
+          tasks.push(async () => {
+            const { items, mine } = await lootRanks({ battleId: b._id, side, type: 'user', dataType: 'damage' }, myId);
+            const n = await nP;
+            items.forEach(it => found.push(mk(b, 'Battle', side, it, ends.battleEnd, n, mine)));
+          });
+          if (roundId) tasks.push(async () => {
+            const { items, mine } = await lootRanks({ roundId, side, type: 'user', dataType: 'damage' }, myId);
+            const n = await nP;
+            items.forEach(it => found.push(mk(b, 'Round ' + (roundNo || '?'), side, it, ends.roundEnd, n, mine)));
+          });
+        }
+      }
+      let done = 0;
+      const results = await Promise.all(tasks.map(t => (async () => { try { return await t(); } catch (e) { return { error: e.message }; } finally { done++; if (Date.now() >= waitUntil) $('status').textContent = `Scanning… ${done}/${tasks.length}`; } })()));
+      const errors = results.filter(x => x && x.error).length;
+      if (errors) note += ` ${errors} request(s) failed.`;
+      rows = found;
+
+      const weaponCodes = [...new Set(rows.filter(r => r.tier === null).map(r => r.code))].sort();
+      $('weapons').innerHTML = weaponCodes.map(c => `<label><input type="checkbox" value="${esc(c)}" ${wantedWeapons.has(c) ? 'checked' : ''}> ${esc(c)}</label>`).join('');
+      document.querySelectorAll('#weapons input').forEach(x => x.onchange = () => {
+        x.checked ? wantedWeapons.add(x.value) : wantedWeapons.delete(x.value);
+        render();
+      });
+
+      const types = [...new Set(battles.map(b => b.type || 'unknown'))].sort();
+      $('types').innerHTML = types.map(t => `<label><input type="checkbox" value="${esc(t)}" ${hiddenTypes.has(t) ? '' : 'checked'}> ${esc(t)}</label>`).join('');
+      document.querySelectorAll('#types input').forEach(x => x.onchange = () => {
+        x.checked ? hiddenTypes.delete(x.value) : hiddenTypes.add(x.value);
+        render();
+      });
+
+      playerState = me;
+      const who = !me ? '' : me.error ? ` ${me.error}: tournament filter is off.`
+        : ` Player ${me.name}${me.muName ? ', MU ' + me.muName : me.mu ? '' : ', no MU'}${me.country && countryName[me.country] ? ', ' + countryName[me.country] : ''}.`;
+      baseStatus = `${battles.length} active battles, ${rows.length} loot slots scanned at ${new Date().toLocaleTimeString()}.${note}${who}`;
+      render();
+    } catch (e) {
+      $('status').textContent = 'Scan failed: ' + e.message + '. Check your internet connection and click Rescan.';
+    } finally {
+      $('rescan').disabled = false;
+    }
+  }
+
+  function render() {
+    const minTier = +$('tier').value;
+    const weapons = wantedWeapons;
+    const showBattle = $('showBattle').checked, showRound = $('showRound').checked;
+    const tourFilter = $('myTour').checked && playerState && !playerState.error;
+    const list = rows.filter(r =>
+      !hiddenTypes.has(r.btype || 'unknown') &&
+      (!tourFilter || r.btype !== 'tournament' || r.canJoin) &&
+      (r.tier === null ? weapons.has(r.code) : r.tier >= minTier) &&
+      (r.scope === 'Battle' ? showBattle : showRound));
+    list.sort((a, b) => (a[sortKey] > b[sortKey] ? 1 : a[sortKey] < b[sortKey] ? -1 : 0) * sortDir);
+
+    const showMine = !!(playerState && !playerState.error);
+    list.forEach(r => { r.held = !!(r.myRank && r.myRank <= r.rank); r.needed = r.held ? 0 : Math.max(0, Math.floor(r.dmg - r.myDmg) + 1); });
+    if (sortKey === 'needed' || sortKey === 'myDmg') list.sort((a, b) => (a[sortKey] > b[sortKey] ? 1 : a[sortKey] < b[sortKey] ? -1 : 0) * sortDir);
+    const cols = [['code', 'Item'], ['skills', 'Stats'], ['scope', 'Pays out'], ['sideCountry', 'Side'], ['rank', 'Rank', 1], ['dmg', 'Damage to beat', 1],
+      ...(showMine ? [['myDmg', 'Your dmg', 1], ['needed', 'Still needed', 1]] : []),
+      ['endsAt', 'Pays out in (earliest)', 1], ['btype', 'Type'], ['region', 'Battle']];
+    $('body').innerHTML = list.length
+      ? `<table><thead><tr>${cols.map(([k, l, n]) => `<th data-k="${k}" class="${n ? 'num' : ''}">${l}${sortKey === k ? (sortDir > 0 ? ' ▲' : ' ▼') : ''}</th>`).join('')}</tr></thead><tbody>${
+          list.map(r => `<tr>
+            <td>${esc(r.code)}</td>
+            <td>${Object.entries(r.skills).map(([k, v]) => esc(k) + ' ' + esc(v)).join(', ')}${r.state < r.maxState ? ` (${r.state}/${r.maxState})` : ''}</td>
+            <td class="${r.scope === 'Battle' ? 'battle' : 'round'}">${r.scope}</td>
+            <td>${esc(r.sideCountry)} <span class="muted">(${r.side})</span></td>
+            <td class="num">${r.rank}</td>
+            <td class="num">${fmt(r.dmg)}</td>
+            ${showMine ? `<td class="num">${r.myDmg ? fmt(r.myDmg) : '–'}</td><td class="num" title="${r.held ? 'You are at or above this rank' : 'Damage to add to pass this rank'}">${r.held ? '<span class="round">held</span>' : fmt(r.needed)}</td>` : ''}
+            <td class="num" title="Earliest possible: if the leading side wins every tick from now on">≥ ${dur(r.endsAt - Date.now())}</td>
+            <td>${esc(r.btype)}</td>
+            <td><a href="${GAME}${esc(r.battleId)}" target="_blank" rel="noopener">${esc(r.region)}</a> <span class="muted">${esc(r.vs)}</span></td>
+          </tr>`).join('')}</tbody></table>`
+      : `<p class="empty">No items match. Lower the minimum tier or tick a weapon type.</p>`;
+    document.querySelectorAll('th').forEach(th => th.onclick = () => {
+      const k = th.dataset.k; sortDir = sortKey === k ? -sortDir : 1; sortKey = k; render();
+    });
+    $('status').textContent = baseStatus + ` Showing ${list.length}.`;
+    saveSettings();
+  }
+
+  if (['1', '2', '3', '4', '5', '6'].includes(String(saved.tier))) $('tier').value = String(saved.tier);
+  if (typeof saved.showBattle === 'boolean') $('showBattle').checked = saved.showBattle;
+  if (typeof saved.showRound === 'boolean') $('showRound').checked = saved.showRound;
+  if (typeof saved.player === 'string') $('player').value = saved.player;
+  if (typeof saved.myTour === 'boolean') $('myTour').checked = saved.myTour;
+  $('player').onchange = () => { saveSettings(); scan(); };
+  $('myTour').onchange = render;
+  ['tier', 'showBattle', 'showRound'].forEach(id => $(id).onchange = render);
+  $('rescan').onclick = scan;
+  scan();
+})();
+</script>
+</body>
+</html>
