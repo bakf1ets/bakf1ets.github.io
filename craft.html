@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WarEra craft calculator</title>
+<!-- Is crafting worth it right now? Costs: live scraps/steel order books (public).
+     Value: recent equipment sales via transaction.getPaginatedTransactions (needs your WarEra API key,
+     sent as X-API-Key and stored only in this browser). Current listings can't be used: the game blocks
+     API tokens from itemOffer.getItemOffers. -->
+<style>
+  :root{--bg:#10161f;--panel:#161e2a;--line:#253245;--text:#dfe6ef;--muted:#93a4b8;--link:#7fb2ff;--good:#8fd6a4;--bad:#f08a8a;--ctl:#1f2a3a;--ctl-line:#3a4b62}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+  header{position:sticky;top:0;z-index:2;background:var(--panel);border-bottom:1px solid var(--line);padding:14px 18px;display:flex;flex-wrap:wrap;gap:14px;align-items:center}
+  h1{margin:0 auto 0 0;font-size:17px;font-weight:650}
+  h1 a{font-size:13px;font-weight:400;margin-left:10px}
+  label{display:inline-flex;gap:5px;align-items:center}
+  input,select,button{background:var(--ctl);color:var(--text);border:1px solid var(--ctl-line);border-radius:6px;padding:5px 9px;font:inherit}
+  input[type=number]{width:64px}
+  button{cursor:pointer} button:hover{background:#2a3850} button:disabled{opacity:.6;cursor:wait}
+  :focus-visible{outline:2px solid var(--link);outline-offset:2px}
+  #status{padding:8px 18px;color:var(--muted);border-bottom:1px solid var(--line)}
+  #keybox{padding:14px 18px;border-bottom:1px solid var(--line);display:none;gap:10px;flex-wrap:wrap;align-items:center}
+  #keybox input{width:min(360px,100%)}
+  main{padding:0 0 24px}
+  .wrap{overflow-x:auto}
+  table{width:100%;border-collapse:collapse}
+  th,td{padding:8px 12px;text-align:left;border-bottom:1px solid #1e2939;white-space:nowrap}
+  th{background:#1a2331;font-weight:600}
+  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+  .good{color:var(--good)} .bad{color:var(--bad)} .muted{color:var(--muted)}
+  tr.main{cursor:pointer} tr.main:hover{background:#18212e}
+  tr.detail td{background:#131a25;color:var(--muted);white-space:normal}
+  .chips{display:flex;flex-wrap:wrap;gap:6px 14px}
+  .note{padding:12px 18px;color:var(--muted);max-width:900px}
+  a{color:var(--link)}
+</style>
+</head>
+<body>
+<header>
+  <h1>WarEra craft calculator <a href="./">← loot scanner</a></h1>
+  <label>Item value
+    <select id="basis">
+      <option value="med" selected>median of recent sales</option>
+      <option value="low">lowest recent sale</option>
+    </select>
+  </label>
+  <label>Materials
+    <select id="matBasis">
+      <option value="buy" selected>bought (cheapest sell order)</option>
+      <option value="own">own stock (highest buy order)</option>
+    </select>
+  </label>
+  <label>Weapon chance <input id="wchance" type="number" min="0" max="100" step="1" value="30">%</label>
+  <button id="rescan">Rescan</button>
+  <button id="keybtn">API key</button>
+</header>
+<div id="keybox">
+  <label>WarEra API key <input id="keyinput" type="password" autocomplete="off" placeholder="paste your key"></label>
+  <button id="keysave">Save</button>
+  <button id="keyclear">Remove key</button>
+  <span class="muted">Stored only in this browser (localStorage) and sent only to api2.warera.io.</span>
+</div>
+<div id="status">Starting…</div>
+<main>
+  <div class="wrap" id="body"></div>
+  <p class="note">Random craft: weapon chance as set above, the rest split evenly over the five armour pieces (assumption).
+  Targeted craft costs twice the steel. Item value comes from equipment sold in the last 24 hours (full condition only);
+  if fewer than 3 sales, the last 10 sales. Current listings are not available to API keys. Click a row for per-item prices.</p>
+</main>
+
+<script>
+(() => {
+  const API = 'https://api2.warera.io/trpc/';
+  const KEY_STORE = 'warera-craft:apikey';
+  const SET_STORE = 'warera-craft:settings:v1';
+  const $ = id => document.getElementById(id);
+  const fmt = n => n == null || isNaN(n) ? '–' : n >= 1000 ? n.toFixed(0) : n >= 100 ? n.toFixed(1) : n.toFixed(2);
+  const sign = n => (n > 0 ? '+' : '') + fmt(n);
+  const store = {
+    get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+    del(k) { try { localStorage.removeItem(k); } catch {} }
+  };
+
+  // Recipes, as shown in the game's craft screen: scraps x3 and steel x2 per rarity step.
+  const RARITIES = [
+    { name: 'Common', weapon: 'knife', tier: 1, scraps: 6, steel: 1 },
+    { name: 'Uncommon', weapon: 'gun', tier: 2, scraps: 18, steel: 2 },
+    { name: 'Rare', weapon: 'rifle', tier: 3, scraps: 54, steel: 4 },
+    { name: 'Epic', weapon: 'sniper', tier: 4, scraps: 162, steel: 8 },
+    { name: 'Legendary', weapon: 'tank', tier: 5, scraps: 486, steel: 16 },
+    { name: 'Mythic', weapon: 'jet', tier: 6, scraps: 1458, steel: 32 }
+  ];
+  const ARMOUR = ['helmet', 'chest', 'boots', 'gloves', 'pants'];
+  const itemsOf = r => [r.weapon, ...ARMOUR.map(a => a + r.tier)];
+
+  async function batch(calls, key) {
+    const procs = calls.map(c => c[0]).join(',');
+    const input = Object.fromEntries(calls.map((c, i) => [i, c[1]]));
+    const headers = key ? { 'X-API-Key': key } : {};
+    const r = await fetch(API + procs + '?batch=1&input=' + encodeURIComponent(JSON.stringify(input)), { credentials: 'omit', headers });
+    if (r.status === 429) throw new Error('API rate limit reached, wait a minute and click Rescan');
+    const j = await r.json();
+    if (!Array.isArray(j)) throw new Error(j.message || 'HTTP ' + r.status);
+    return j.map(x => (x && x.result ? x.result.data : { error: (x && x.error && x.error.message) || 'no result' }));
+  }
+
+  let data = null, open = new Set();
+  const saved = (() => { try { return JSON.parse(store.get(SET_STORE)) || {}; } catch { return {}; } })();
+  if (saved.basis) $('basis').value = saved.basis;
+  if (saved.matBasis) $('matBasis').value = saved.matBasis;
+  if (typeof saved.wchance === 'number') $('wchance').value = saved.wchance;
+  const saveSettings = () => store.set(SET_STORE, JSON.stringify({ basis: $('basis').value, matBasis: $('matBasis').value, wchance: +$('wchance').value }));
+
+  function showKeyBox(show) { $('keybox').style.display = show ? 'flex' : 'none'; if (show) $('keyinput').focus(); }
+
+  async function scan() {
+    const key = store.get(KEY_STORE);
+    if (!key) { showKeyBox(true); $('status').textContent = 'Enter your WarEra API key to load equipment sales.'; return; }
+    $('rescan').disabled = true;
+    $('status').textContent = 'Loading prices…';
+    try {
+      const codes = RARITIES.flatMap(itemsOf);
+      const [materials, sales] = await Promise.all([
+        batch([['tradingOrder.getTopOrders', { itemCode: 'scraps' }], ['tradingOrder.getTopOrders', { itemCode: 'steel' }]]),
+        batch(codes.map(c => ['transaction.getPaginatedTransactions', { transactionType: 'itemMarket', itemCode: c, limit: 30 }]), key)
+      ]);
+      const authErr = sales.find(s => s.error);
+      if (authErr && sales.every(s => s.error)) throw new Error(/token|auth|key/i.test(authErr.error) ? 'API key rejected: ' + authErr.error : authErr.error);
+      const book = b => ({ sell: b.sellOrders && b.sellOrders[0] ? b.sellOrders[0].price : null, buy: b.buyOrders && b.buyOrders[0] ? b.buyOrders[0].price : null });
+      const now = Date.now();
+      const items = {};
+      codes.forEach((c, i) => {
+        const s = sales[i];
+        if (!s || s.error) { items[c] = { error: s && s.error }; return; }
+        const list = (s.items || []).filter(t => !t.item || t.item.state === t.item.maxState)
+          .map(t => ({ p: t.money / (t.quantity || 1), at: new Date(t.createdAt).getTime() }));
+        const recent = list.filter(x => now - x.at < 24 * 3600e3);
+        const use = recent.length >= 3 ? recent : list.slice(0, 10);
+        const ps = use.map(x => x.p).sort((a, b) => a - b);
+        items[c] = { n: use.length, med: ps.length ? ps[Math.floor(ps.length / 2)] : null, low: ps.length ? ps[0] : null,
+          window: recent.length >= 3 ? '24h' : 'last ' + use.length, lastAt: list[0] ? list[0].at : null };
+      });
+      data = { scraps: book(materials[0]), steel: book(materials[1]), items, at: new Date() };
+      render();
+    } catch (e) {
+      $('status').textContent = 'Failed: ' + e.message;
+      if (/key rejected/i.test(e.message)) showKeyBox(true);
+    } finally {
+      $('rescan').disabled = false;
+    }
+  }
+
+  function render() {
+    if (!data) return;
+    const basis = $('basis').value, mat = $('matBasis').value;
+    const wc = Math.min(100, Math.max(0, +$('wchance').value || 0)) / 100;
+    const scP = mat === 'buy' ? data.scraps.sell : data.scraps.buy;
+    const stP = mat === 'buy' ? data.steel.sell : data.steel.buy;
+    const val = c => data.items[c] && data.items[c][basis];
+    const rows = RARITIES.map(r => {
+      const costR = r.scraps * scP + r.steel * stP;
+      const costT = r.scraps * scP + 2 * r.steel * stP;
+      const armour = ARMOUR.map(a => val(a + r.tier));
+      const ev = wc * val(r.weapon) + (1 - wc) * armour.reduce((a, b) => a + b, 0) / armour.length;
+      const ranked = itemsOf(r).map(c => [c, val(c)]).sort((a, b) => b[1] - a[1]);
+      const [bestCode, bestVal] = ranked[0];
+      const pR = ev - costR, pT = bestVal - costT;
+      const advice = Math.max(pR, pT) <= 0 ? 'Don\'t craft' : pT > pR ? 'Craft ' + bestCode : 'Craft random';
+      return { r, costR, ev, pR, costT, bestCode, bestVal, pT, advice };
+    });
+    const cls = n => (n > 0 ? 'good' : 'bad');
+    $('body').innerHTML = `<table><thead><tr>
+        <th>Rarity</th><th class="num">Random: cost</th><th class="num">Random: expected value</th><th class="num">Random: profit</th>
+        <th>Best targeted</th><th class="num">Targeted: cost</th><th class="num">Targeted: profit</th><th>Advice</th></tr></thead><tbody>${
+      rows.map(x => `<tr class="main" data-r="${x.r.name}">
+          <td>${x.r.name} <span class="muted">(${x.r.scraps} scraps, ${x.r.steel} steel)</span></td>
+          <td class="num">${fmt(x.costR)}</td><td class="num">${fmt(x.ev)}</td>
+          <td class="num ${cls(x.pR)}">${sign(x.pR)} <span class="muted">(${sign(x.pR / x.costR * 100).replace(/\.\d+$/, '')}%)</span></td>
+          <td>${x.bestCode} <span class="muted">${fmt(x.bestVal)}</span></td>
+          <td class="num">${fmt(x.costT)}</td>
+          <td class="num ${cls(x.pT)}">${sign(x.pT)}</td>
+          <td class="${x.advice.startsWith('Don') ? 'muted' : 'good'}">${x.advice}</td></tr>
+        ${open.has(x.r.name) ? `<tr class="detail"><td colspan="8"><div class="chips">${itemsOf(x.r).map(c => {
+            const it = data.items[c] || {};
+            return `<span>${c}: median ${fmt(it.med)}, lowest ${fmt(it.low)} <span class="muted">(${it.n || 0} sales, ${it.window || '–'})</span></span>`;
+          }).join('')}</div></td></tr>` : ''}`).join('')}</tbody></table>`;
+    document.querySelectorAll('tr.main').forEach(tr => tr.onclick = () => {
+      const k = tr.dataset.r; open.has(k) ? open.delete(k) : open.add(k); render();
+    });
+    $('status').textContent = `Prices at ${data.at.toLocaleTimeString()}: scraps ${scP.toFixed(3)}, steel ${stP.toFixed(3)} (${mat === 'buy' ? 'cheapest sell order' : 'highest buy order'}). Item value: ${basis === 'med' ? 'median' : 'lowest'} of recent sales.`;
+    saveSettings();
+  }
+
+  $('keybtn').onclick = () => showKeyBox($('keybox').style.display !== 'flex');
+  $('keysave').onclick = () => {
+    const v = $('keyinput').value.trim();
+    if (!v) return;
+    store.set(KEY_STORE, v); $('keyinput').value = ''; showKeyBox(false); scan();
+  };
+  $('keyinput').onkeydown = e => { if (e.key === 'Enter') $('keysave').click(); };
+  $('keyclear').onclick = () => { store.del(KEY_STORE); $('keyinput').value = ''; data = null; $('body').innerHTML = ''; $('status').textContent = 'API key removed.'; };
+  ['basis', 'matBasis', 'wchance'].forEach(id => $(id).oninput = render);
+  $('rescan').onclick = scan;
+  scan();
+})();
+</script>
+</body>
+</html>
