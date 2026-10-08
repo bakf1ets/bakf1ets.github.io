@@ -49,6 +49,7 @@
   <label title="Only show tournament loot on the side of a team that includes your MU or your country"><input type="checkbox" id="myTour" checked> Only tournaments I can join</label>
   <label><input type="checkbox" id="showBattle" checked> Battle</label>
   <label><input type="checkbox" id="showRound" checked> Round</label>
+  <label title="Show a round item and a battle item on the same side together: one push of damage in the current round counts for both rankings. Uses the minimum tier for both items; weapons count by rarity (sniper 4, tank 5, jet 6)."><input type="checkbox" id="pairs"> Round + battle pairs</label>
   <button id="rescan">Rescan</button>
 </header>
 <div id="status">Scanning…</div>
@@ -117,6 +118,11 @@
   const fmt = n => n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : String(Math.round(n));
   const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   const tierOf = code => { const m = /^([a-z]+?)(\d+)$/.exec(code); return m ? m && +m[2] : null; };
+  // Weapon rarity from gameConfig items: knife common … jet mythic. Used to compare weapons and armour in pairs.
+  const WEAPON_TIER = { knife: 1, gun: 2, rifle: 3, sniper: 4, tank: 5, jet: 6 };
+  const rarityOfCode = code => tierOf(code) ?? WEAPON_TIER[code] ?? null;
+  const rarityOf = r => rarityOfCode(r.code);
+  const TIER_NAME = { 1: 'common', 2: 'uncommon', 3: 'rare', 4: 'epic', 5: 'legendary', 6: 'mythic' };
 
   // Filter and sort choices are remembered in this browser (localStorage). Storage can be unavailable; then defaults apply.
   const SETTINGS_KEY = 'warera-loot-scanner:settings:v1';
@@ -126,12 +132,14 @@
   const hiddenTypes = new Set(Array.isArray(saved.hiddenTypes) ? saved.hiddenTypes : []);
   let playerState = null;
   let rows = [], sortKey = saved.sortKey || 'dmg', sortDir = saved.sortDir === -1 ? -1 : 1, baseStatus = '';
+  let pairSortKey = saved.pairSortKey || 'needed', pairSortDir = saved.pairSortDir === -1 ? -1 : 1;
   function saveSettings() {
     try {
       localStorage.setItem(SETTINGS_KEY, JSON.stringify({
         tier: $('tier').value, weapons: [...wantedWeapons], hiddenTypes: [...hiddenTypes],
         player: $('player').value.trim(), myTour: $('myTour').checked,
-        showBattle: $('showBattle').checked, showRound: $('showRound').checked, sortKey, sortDir
+        showBattle: $('showBattle').checked, showRound: $('showRound').checked, sortKey, sortDir,
+        pairs: $('pairs').checked, pairSortKey, pairSortDir
       }));
     } catch { /* storage unavailable: settings only last this session */ }
   }
@@ -194,11 +202,12 @@
   // Equipment loot runs from high to low tier down the ranking. An item with a higher tier than every
   // equipment item in the 30 ranks above it doesn't fit that order (seen: a pants5 at rank 1030 among
   // tier 2 items, created hours before its neighbours). Such items are flagged and hidden.
+  // Weapons are checked by rarity as well (seen: a tank at rank 52 among tier 2 items).
   function markOutliers(items) {
-    const eq = items.filter(it => it.lootItem && tierOf(it.lootItem.code) !== null);
+    const eq = items.filter(it => it.lootItem && rarityOfCode(it.lootItem.code) !== null);
     eq.forEach((it, i) => {
-      const above = eq.slice(Math.max(0, i - 30), i).map(a => tierOf(a.lootItem.code));
-      it.suspect = above.length >= 10 && tierOf(it.lootItem.code) > Math.max(...above);
+      const above = eq.slice(Math.max(0, i - 30), i).map(a => rarityOfCode(a.lootItem.code));
+      it.suspect = above.length >= 10 && rarityOfCode(it.lootItem.code) > Math.max(...above);
     });
     return items;
   }
@@ -324,16 +333,84 @@
     }
   }
 
+  // Damage you still have to add to pass a slot (0 if you already hold it or a better rank).
+  const neededFor = r => (r.myRank && r.myRank <= r.rank) ? 0 : Math.max(0, Math.floor(r.dmg - r.myDmg) + 1);
+
+  // Pairs: a current-round slot and a battle slot on the same side of the same battle.
+  // Damage you deal now counts for both the round ranking and the battle ranking,
+  // so the damage to add for both is the larger of the two gaps.
+  function buildPairs(base, minTier) {
+    const groups = new Map();
+    for (const r of base) {
+      const t = rarityOf(r);
+      if (t === null || t < minTier) continue;
+      const k = r.battleId + '|' + r.side;
+      if (!groups.has(k)) groups.set(k, { battle: [], round: [] });
+      groups.get(k)[r.scope === 'Battle' ? 'battle' : 'round'].push(r);
+    }
+    // Per battle side, keep only the cheapest pair for each combination of tiers (e.g. mythic round +
+    // legendary battle), so one battle doesn't fill the list with every rank combination.
+    const best = new Map();
+    for (const [k, g] of groups) for (const b of g.battle) for (const r of g.round) {
+      const needB = neededFor(b), needR = neededFor(r);
+      const p = { b, r, needB, needR, needed: Math.max(needB, needR),
+        tierSum: rarityOf(b) + rarityOf(r), roundEnd: r.endsAt, region: b.region, btype: b.btype,
+        sideCountry: b.sideCountry };
+      const key = k + '|' + rarityOf(r) + '|' + rarityOf(b);
+      const cur = best.get(key);
+      if (!cur || p.needed < cur.needed || (p.needed === cur.needed && needB + needR < cur.needB + cur.needR)) best.set(key, p);
+    }
+    return [...best.values()];
+  }
+
+  function renderPairs(base, minTier, statusExtra) {
+    const pairs = buildPairs(base, minTier);
+    const val = (p, k) => p[k];
+    pairs.sort((x, y) => {
+      const a = val(x, pairSortKey), b = val(y, pairSortKey);
+      return ((a > b ? 1 : a < b ? -1 : 0) * pairSortDir) || (x.needed - y.needed);
+    });
+    const showMine = !!(playerState && !playerState.error);
+    const item = r => `${esc(r.code)} <span class="muted">${esc(TIER_NAME[rarityOf(r)] || '')}${Object.keys(r.skills).length ? ' · ' + Object.entries(r.skills).map(([k, v]) => esc(k) + ' ' + esc(v)).join(', ') : ''}</span>`;
+    const gap = (r, need) => (need === 0 ? '<span class="round">held</span>' : fmt(need));
+    const cols = [['tierSum', 'Round item (sort: best tiers)'], [null, 'Battle item'], ['sideCountry', 'Side'],
+      [null, 'Round: rank / dmg to beat', 1], [null, 'Battle: rank / dmg to beat', 1],
+      ...(showMine ? [[null, 'Your round / battle dmg', 1]] : []),
+      ['needed', 'Still needed for both', 1], ['roundEnd', 'Round pays out in (earliest)', 1], ['btype', 'Type'], ['region', 'Battle']];
+    $('body').innerHTML = pairs.length
+      ? `<table><thead><tr>${cols.map(([k, l, n]) => `<th ${k ? `data-pk="${k}"` : ''} class="${n ? 'num' : ''}" ${k ? '' : 'style="cursor:default"'}>${l}${k && pairSortKey === k ? (pairSortDir > 0 ? ' ▲' : ' ▼') : ''}</th>`).join('')}</tr></thead><tbody>${
+          pairs.map(p => `<tr>
+            <td class="round">${item(p.r)} <span class="muted">(${esc(p.r.scope)})</span></td>
+            <td class="battle">${item(p.b)}</td>
+            <td>${esc(p.sideCountry)} <span class="muted">(${p.b.side})</span></td>
+            <td class="num">#${p.r.rank} / ${fmt(p.r.dmg)}${showMine ? ` <span class="muted">(+${gap(p.r, p.needR)})</span>` : ''}</td>
+            <td class="num">#${p.b.rank} / ${fmt(p.b.dmg)}${showMine ? ` <span class="muted">(+${gap(p.b, p.needB)})</span>` : ''}</td>
+            ${showMine ? `<td class="num">${p.r.myDmg ? fmt(p.r.myDmg) : '–'} / ${p.b.myDmg ? fmt(p.b.myDmg) : '–'}</td>` : ''}
+            <td class="num" title="Damage to add in the current round to pass both slots">${p.needed === 0 ? '<span class="round">both held</span>' : fmt(p.needed)}</td>
+            <td class="num" title="Earliest possible: if the leading side wins every tick from now on. The battle item pays out when the battle ends.">≥ ${dur(p.roundEnd - Date.now())}</td>
+            <td>${esc(p.btype)}</td>
+            <td><a href="${GAME}${esc(p.b.battleId)}" target="_blank" rel="noopener">${esc(p.region)}</a> <span class="muted">${esc(p.b.vs)}</span></td>
+          </tr>`).join('')}</tbody></table>`
+      : `<p class="empty">No round + battle pairs at this minimum tier. Lower the minimum tier.</p>`;
+    document.querySelectorAll('th[data-pk]').forEach(th => th.onclick = () => {
+      const k = th.dataset.pk; pairSortDir = pairSortKey === k ? -pairSortDir : (k === 'tierSum' ? -1 : 1); pairSortKey = k; render();
+    });
+    $('status').textContent = baseStatus + ` Showing ${pairs.length} pair(s).` + statusExtra;
+    saveSettings();
+  }
+
   function render() {
     const minTier = +$('tier').value;
     const weapons = wantedWeapons;
     const showBattle = $('showBattle').checked, showRound = $('showRound').checked;
     const tourFilter = $('myTour').checked && playerState && !playerState.error;
     const suspects = rows.filter(r => r.suspect).length;
-    const list = rows.filter(r =>
+    const base = rows.filter(r =>
       !r.suspect &&
       !hiddenTypes.has(r.btype || 'unknown') &&
-      (!tourFilter || r.btype !== 'tournament' || r.canJoin) &&
+      (!tourFilter || r.btype !== 'tournament' || r.canJoin));
+    if ($('pairs').checked) return renderPairs(base, minTier, suspects ? ` ${suspects} out-of-order item(s) hidden.` : '');
+    const list = base.filter(r =>
       (r.tier === null ? weapons.has(r.code) : r.tier >= minTier) &&
       (r.scope === 'Battle' ? showBattle : showRound));
     list.sort((a, b) => (a[sortKey] > b[sortKey] ? 1 : a[sortKey] < b[sortKey] ? -1 : 0) * sortDir);
@@ -371,9 +448,10 @@
   if (typeof saved.showRound === 'boolean') $('showRound').checked = saved.showRound;
   if (typeof saved.player === 'string') $('player').value = saved.player;
   if (typeof saved.myTour === 'boolean') $('myTour').checked = saved.myTour;
+  if (typeof saved.pairs === 'boolean') $('pairs').checked = saved.pairs;
   $('player').onchange = () => { saveSettings(); scan(); };
   $('myTour').onchange = render;
-  ['tier', 'showBattle', 'showRound'].forEach(id => $(id).onchange = render);
+  ['tier', 'showBattle', 'showRound', 'pairs'].forEach(id => $(id).onchange = render);
   $('rescan').onclick = scan;
   scan();
 })();
