@@ -21,7 +21,7 @@
   button:hover{background:#2a3850}
   button:disabled{opacity:.6;cursor:wait}
   :focus-visible{outline:2px solid var(--link);outline-offset:2px}
-  #weapons,#types{display:inline-flex;flex-wrap:wrap;gap:10px}
+  #types{display:inline-flex;flex-wrap:wrap;gap:10px}
   #types{padding-left:14px;border-left:1px solid var(--line)}
   #status{padding:8px 18px;color:var(--muted);border-bottom:1px solid var(--line)}
   main{padding:0 0 24px}
@@ -40,10 +40,9 @@
 <body>
 <header>
   <h1>WarEra loot scanner</h1>
-  <label>Min. equipment tier
+  <label title="Weapons count by rarity: knife 1, gun 2, rifle 3, sniper 4, tank 5, jet 6">Min. tier
     <select id="tier"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option selected>6</option></select>
   </label>
-  <span id="weapons"></span>
   <span id="types" aria-label="Battle type"></span>
   <label>Player <input id="player" type="text" placeholder="your username" size="14" autocomplete="off"></label>
   <label title="Only show tournament loot on the side of a team that includes your MU or your country"><input type="checkbox" id="myTour" checked> Only tournaments I can join</label>
@@ -118,7 +117,7 @@
   const fmt = n => n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : String(Math.round(n));
   const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   const tierOf = code => { const m = /^([a-z]+?)(\d+)$/.exec(code); return m ? m && +m[2] : null; };
-  // Weapon rarity from gameConfig items: knife common … jet mythic. Used to compare weapons and armour in pairs.
+  // Weapon rarity from gameConfig items: knife common … jet mythic. Weapons count in the tier columns and pairs by this rarity.
   const WEAPON_TIER = { knife: 1, gun: 2, rifle: 3, sniper: 4, tank: 5, jet: 6 };
   const rarityOfCode = code => tierOf(code) ?? WEAPON_TIER[code] ?? null;
   const rarityOf = r => rarityOfCode(r.code);
@@ -127,7 +126,6 @@
   // Filter and sort choices are remembered in this browser (localStorage). Storage can be unavailable; then defaults apply.
   const SETTINGS_KEY = 'warera-loot-scanner:settings:v1';
   const saved = (() => { try { return JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {}; } catch { return {}; } })();
-  const wantedWeapons = new Set(Array.isArray(saved.weapons) ? saved.weapons : []);
   // Battle types are stored as the ones you switched OFF, so a type that appears later is shown by default.
   const hiddenTypes = new Set(Array.isArray(saved.hiddenTypes) ? saved.hiddenTypes : []);
   let playerState = null;
@@ -136,7 +134,7 @@
   function saveSettings() {
     try {
       localStorage.setItem(SETTINGS_KEY, JSON.stringify({
-        tier: $('tier').value, weapons: [...wantedWeapons], hiddenTypes: [...hiddenTypes],
+        tier: $('tier').value, hiddenTypes: [...hiddenTypes],
         player: $('player').value.trim(), myTour: $('myTour').checked,
         showBattle: $('showBattle').checked, showRound: $('showRound').checked, sortKey, sortDir,
         pairs: $('pairs').checked, pairSortKey, pairSortDir
@@ -210,8 +208,10 @@
     const eq = items.filter(it => it.lootItem && rarityOfCode(it.lootItem.code) !== null);
     const normal = [];
     for (const it of eq) {
-      const above = normal.slice(-30).map(a => rarityOfCode(a.lootItem.code));
-      it.suspect = above.length >= 10 && rarityOfCode(it.lootItem.code) > Math.max(...above);
+      // Compare with the 10 nearest unflagged items above. A wider window reaches the top ranks in a
+      // small ranking (seen: boots4 at rank 28 among tier 2 items, with helmet4 at ranks 7-8).
+      const above = normal.slice(-10).map(a => rarityOfCode(a.lootItem.code));
+      it.suspect = above.length >= 5 && rarityOfCode(it.lootItem.code) > Math.max(...above);
       if (!it.suspect) normal.push(it);
     }
     return items;
@@ -312,13 +312,6 @@
       if (errors) note += ` ${errors} request(s) failed.`;
       rows = found;
 
-      const weaponCodes = [...new Set(rows.filter(r => r.tier === null).map(r => r.code))].sort();
-      $('weapons').innerHTML = weaponCodes.map(c => `<label><input type="checkbox" value="${esc(c)}" ${wantedWeapons.has(c) ? 'checked' : ''}> ${esc(c)}</label>`).join('');
-      document.querySelectorAll('#weapons input').forEach(x => x.onchange = () => {
-        x.checked ? wantedWeapons.add(x.value) : wantedWeapons.delete(x.value);
-        render();
-      });
-
       const types = [...new Set(battles.map(b => b.type || 'unknown'))].sort();
       $('types').innerHTML = types.map(t => `<label><input type="checkbox" value="${esc(t)}" ${hiddenTypes.has(t) ? '' : 'checked'}> ${esc(t)}</label>`).join('');
       document.querySelectorAll('#types input').forEach(x => x.onchange = () => {
@@ -368,6 +361,29 @@
     return [...best.values()];
   }
 
+  // One row per battle side and payout (current round or battle). Per tier: the cheapest slot,
+  // i.e. the lowest-ranked item of that tier. Beat its damage and an item of that tier is yours.
+  // Weapons count by rarity (gun 2, rifle 3, sniper 4, tank 5, jet 6).
+  function buildGroups(base, minTier, showMine) {
+    const groups = new Map();
+    for (const r of base) {
+      const t = rarityOf(r);
+      if (t === null) continue;
+      const k = r.battleId + '|' + r.side + '|' + r.scope;
+      let g = groups.get(k);
+      if (!g) groups.set(k, g = { battleId: r.battleId, side: r.side, scope: r.scope, sideCountry: r.sideCountry,
+        region: r.region, vs: r.vs, btype: r.btype, endsAt: r.endsAt, myDmg: r.myDmg, slots: {} });
+      if (!g.slots[t] || r.rank > g.slots[t].rank) g.slots[t] = r;
+    }
+    const list = [];
+    for (const g of groups.values()) {
+      if (!Object.keys(g.slots).some(t => +t >= minTier)) continue;
+      for (let t = 1; t <= 6; t++) { const s = g.slots[t]; g['t' + t] = s ? (showMine ? neededFor(s) : s.dmg) : null; }
+      list.push(g);
+    }
+    return list;
+  }
+
   function renderPairs(base, minTier, statusExtra) {
     const pairs = buildPairs(base, minTier);
     const val = (p, k) => p[k];
@@ -406,7 +422,6 @@
 
   function render() {
     const minTier = +$('tier').value;
-    const weapons = wantedWeapons;
     const showBattle = $('showBattle').checked, showRound = $('showRound').checked;
     const tourFilter = $('myTour').checked && playerState && !playerState.error;
     const suspects = rows.filter(r => r.suspect).length;
@@ -415,36 +430,46 @@
       !hiddenTypes.has(r.btype || 'unknown') &&
       (!tourFilter || r.btype !== 'tournament' || r.canJoin));
     if ($('pairs').checked) return renderPairs(base, minTier, suspects ? ` ${suspects} out-of-order item(s) hidden.` : '');
-    const list = base.filter(r =>
-      (r.tier === null ? weapons.has(r.code) : r.tier >= minTier) &&
-      (r.scope === 'Battle' ? showBattle : showRound));
-    list.sort((a, b) => (a[sortKey] > b[sortKey] ? 1 : a[sortKey] < b[sortKey] ? -1 : 0) * sortDir);
-
     const showMine = !!(playerState && !playerState.error);
-    list.forEach(r => { r.held = !!(r.myRank && r.myRank <= r.rank); r.needed = r.held ? 0 : Math.max(0, Math.floor(r.dmg - r.myDmg) + 1); });
-    if (sortKey === 'needed' || sortKey === 'myDmg') list.sort((a, b) => (a[sortKey] > b[sortKey] ? 1 : a[sortKey] < b[sortKey] ? -1 : 0) * sortDir);
-    const cols = [['code', 'Item'], ['skills', 'Stats'], ['scope', 'Pays out'], ['sideCountry', 'Side'], ['rank', 'Rank', 1], ['dmg', 'Damage to beat', 1],
-      ...(showMine ? [['myDmg', 'Your dmg', 1], ['needed', 'Still needed', 1]] : []),
-      ['endsAt', 'Pays out in (earliest)', 1], ['btype', 'Type'], ['region', 'Battle']];
+    const tiers = []; for (let t = 6; t >= minTier; t--) tiers.push(t);
+    const list = buildGroups(base.filter(r => r.scope === 'Battle' ? showBattle : showRound), minTier, showMine);
+    const valid = new Set([...tiers.map(t => 't' + t), 'region', 'sideCountry', 'scope', 'myDmg', 'endsAt', 'btype']);
+    if (!valid.has(sortKey)) { sortKey = 't' + minTier; sortDir = 1; }
+    // Empty cells (tier not on offer) always go to the bottom, whatever the direction.
+    list.sort((a, b) => {
+      const x = a[sortKey], y = b[sortKey];
+      if (x == null || y == null) return (x == null) - (y == null);
+      return (x > y ? 1 : x < y ? -1 : 0) * sortDir;
+    });
+    const cell = (g, t) => {
+      const s = g.slots[t];
+      if (!s) return '<td class="num muted">–</td>';
+      const stats = Object.entries(s.skills).map(([k, v]) => k + ' ' + v).join(', ');
+      const tip = `${s.code}${stats ? ' (' + stats + ')' : ''}, rank ${s.rank}, ${fmt(s.dmg)} damage`;
+      const held = showMine && g['t' + t] === 0;
+      return `<td class="num" title="${esc(tip)}">${held ? '<span class="round">held</span>' : fmt(g['t' + t])}</td>`;
+    };
+    const cols = [['region', 'Battle'], ['sideCountry', 'Side'], ['scope', 'Pays out'],
+      ...tiers.map(t => ['t' + t, `T${t} ${TIER_NAME[t]}`, 1]),
+      ...(showMine ? [['myDmg', 'Your dmg', 1]] : []),
+      ['endsAt', 'Pays out in (earliest)', 1], ['btype', 'Type']];
     $('body').innerHTML = list.length
-      ? `<table><thead><tr>${cols.map(([k, l, n]) => `<th data-k="${k}" class="${n ? 'num' : ''}">${l}${sortKey === k ? (sortDir > 0 ? ' ▲' : ' ▼') : ''}</th>`).join('')}</tr></thead><tbody>${
-          list.map(r => `<tr>
-            <td>${esc(r.code)}</td>
-            <td>${Object.entries(r.skills).map(([k, v]) => esc(k) + ' ' + esc(v)).join(', ')}${r.state < r.maxState ? ` (${r.state}/${r.maxState})` : ''}</td>
-            <td class="${r.scope === 'Battle' ? 'battle' : 'round'}">${r.scope}</td>
-            <td>${esc(r.sideCountry)} <span class="muted">(${r.side})</span></td>
-            <td class="num">${r.rank}</td>
-            <td class="num">${fmt(r.dmg)}</td>
-            ${showMine ? `<td class="num">${r.myDmg ? fmt(r.myDmg) : '–'}</td><td class="num" title="${r.held ? 'You are at or above this rank' : 'Damage to add to pass this rank'}">${r.held ? '<span class="round">held</span>' : fmt(r.needed)}</td>` : ''}
-            <td class="num" title="Earliest possible: if the leading side wins every tick from now on">≥ ${dur(r.endsAt - Date.now())}</td>
-            <td>${esc(r.btype)}</td>
-            <td><a href="${GAME}${esc(r.battleId)}" target="_blank" rel="noopener">${esc(r.region)}</a> <span class="muted">${esc(r.vs)}</span></td>
+      ? `<p class="muted" style="margin:8px 18px">${showMine ? 'Damage you still have to add' : 'Damage to beat'} for the cheapest item of each tier. Hover a number for the item and rank.</p>
+        <table><thead><tr>${cols.map(([k, l, n]) => `<th data-k="${k}" class="${n ? 'num' : ''}">${l}${sortKey === k ? (sortDir > 0 ? ' ▲' : ' ▼') : ''}</th>`).join('')}</tr></thead><tbody>${
+          list.map(g => `<tr>
+            <td><a href="${GAME}${esc(g.battleId)}" target="_blank" rel="noopener">${esc(g.region)}</a> <span class="muted">${esc(g.vs)}</span></td>
+            <td>${esc(g.sideCountry)} <span class="muted">(${g.side})</span></td>
+            <td class="${g.scope === 'Battle' ? 'battle' : 'round'}">${esc(g.scope)}</td>
+            ${tiers.map(t => cell(g, t)).join('')}
+            ${showMine ? `<td class="num">${g.myDmg ? fmt(g.myDmg) : '–'}</td>` : ''}
+            <td class="num" title="Earliest possible: if the leading side wins every tick from now on">≥ ${dur(g.endsAt - Date.now())}</td>
+            <td>${esc(g.btype)}</td>
           </tr>`).join('')}</tbody></table>`
-      : `<p class="empty">No items match. Lower the minimum tier or tick a weapon type.</p>`;
-    document.querySelectorAll('th').forEach(th => th.onclick = () => {
+      : `<p class="empty">No loot at this minimum tier. Lower the minimum tier.</p>`;
+    document.querySelectorAll('th[data-k]').forEach(th => th.onclick = () => {
       const k = th.dataset.k; sortDir = sortKey === k ? -sortDir : 1; sortKey = k; render();
     });
-    $('status').textContent = baseStatus + ` Showing ${list.length}.` + (suspects ? ` ${suspects} out-of-order item(s) hidden.` : '');
+    $('status').textContent = baseStatus + ` Showing ${list.length} battle side(s).` + (suspects ? ` ${suspects} out-of-order item(s) hidden.` : '');
     saveSettings();
   }
 
