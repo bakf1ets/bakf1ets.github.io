@@ -203,12 +203,17 @@
   // equipment item in the 30 ranks above it doesn't fit that order (seen: a pants5 at rank 1030 among
   // tier 2 items, created hours before its neighbours). Such items are flagged and hidden.
   // Weapons are checked by rarity as well (seen: a tank at rank 52 among tier 2 items).
+  // Only items that are not flagged themselves count as "above": outliers can sit close together
+  // (seen: gloves4 at rank 1150 and boots4 at rank 1161 among tier 2 items), and a flagged item
+  // must not make the next outlier look normal.
   function markOutliers(items) {
     const eq = items.filter(it => it.lootItem && rarityOfCode(it.lootItem.code) !== null);
-    eq.forEach((it, i) => {
-      const above = eq.slice(Math.max(0, i - 30), i).map(a => rarityOfCode(a.lootItem.code));
+    const normal = [];
+    for (const it of eq) {
+      const above = normal.slice(-30).map(a => rarityOfCode(a.lootItem.code));
       it.suspect = above.length >= 10 && rarityOfCode(it.lootItem.code) > Math.max(...above);
-    });
+      if (!it.suspect) normal.push(it);
+    }
     return items;
   }
 
